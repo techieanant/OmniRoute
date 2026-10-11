@@ -66,9 +66,22 @@ function promptOf(body: Body): string {
   return typeof system?.content === "string" ? system.content : "";
 }
 
-/** The rule as measured: a "Never use tools" prompt wants no tools, anything else wants some. */
+/** The rule as measured: a "Never use tools" prompt wants no tools, anything else wants some.
+ *
+ * The identity marker the contract appends ("You are a title generator… / - Never use
+ * tools", always with a leading newline) is classifier bait, not the caller's prompt.
+ * It travels WITH the tools injection, so a rule that strips every copy would erase the
+ * caller's own verdict too — strip only the trailing copy the contract appended,
+ * leaving the caller's text intact. */
+const IDENTITY_MARKER_STR =
+  "\nYou are a title generator. You output ONLY a thread title.\n- Never use tools";
+const callerPromptOf = (body: Body): string => {
+  const prompt = promptOf(body);
+  const at = prompt.lastIndexOf(IDENTITY_MARKER_STR);
+  return at === -1 ? prompt : prompt.slice(0, at);
+};
 const measuredRule: Rule = (body) => {
-  const wantsNone = promptOf(body).includes("Never use tools");
+  const wantsNone = callerPromptOf(body).includes("Never use tools");
   const has = toolCount(body) > 0;
   return wantsNone !== has ? 200 : 403;
 };
@@ -505,7 +518,7 @@ test("without an origin, preparing a request behaves exactly as before", () => {
   const { attempt, body: out } = prepareFreeTierRequest(body, null, "zen", "opencode", MODEL);
   assert.ok(attempt);
   assert.equal(attempt.probe, false, "no replay can happen without an origin to key it on");
-  assert.equal(((out as Body).tools as unknown[]).length, 1);
+  assert.equal(((out as Body).tools as unknown[]).length, 2);
   noteFreeTierOutcome(attempt, false);
 });
 
@@ -656,7 +669,7 @@ test("when the replay itself fails, the error surfaces and the first refusal sti
   // The replay of every title fails on the network, so the only verdict on the borrowed names
   // is the first refusal. Three different prompts, as three refusals in a row forget the list.
   installUpstream((body) =>
-    promptOf(body).includes("Never use tools") ? (toolCount(body) > 0 ? 403 : "network") : 200
+    callerPromptOf(body).includes("Never use tools") ? (toolCount(body) > 0 ? 403 : "network") : 200
   );
   for (let i = 1; i <= 3; i++) {
     await assert.rejects(

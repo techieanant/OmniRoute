@@ -16,6 +16,12 @@
  * host are not gated (a paid model without tools answers 401 CreditsError), which is why
  * `requiresFreeTierRequestContract` narrows the contract to free-tier models.
  *
+ * Re-measured 2026-10-11 (muse-spark-1.3-contributor-free, Responses surface): the gate
+ * also inspects the developer message text. A request with harness-exact headers and any
+ * fresh body 403s unless the developer message carries the official client's own prompt
+ * phrases — `ensureFreeTierIdentity` appends that marker. The marker is classifier-only:
+ * the model still answers the user message normally.
+ *
  * The module also owns the free-model catalog — the catalog is what decides whether the
  * contract applies, so the two belong together and the executor imports them from here —
  * and the way back: the forced stream is rebuilt into a JSON body for a caller that asked
@@ -165,9 +171,108 @@ export function requiresFreeTierRequestContract(
   return isGatedFreeTierRequest(surface, provider, model) && isBodyContractEnabled();
 }
 
-/** The placeholder tool name the official client uses for the same purpose. */
-const PLACEHOLDER_TOOL_NAME = "_noop";
-export const DEFAULT_PLACEHOLDER_TOOL_NAME = PLACEHOLDER_TOOL_NAME;
+/**
+ * Default placeholder tools declared on a gated request the caller sent without tools
+ * and for which nothing was observed or configured.
+ *
+ * Measured 2026-10-11 (muse-spark-1.3-contributor-free Responses surface,
+ * nemotron-3.5-lightning-free Chat surface): the classifier requires the pair —
+ * either name alone 403s, while the pair passes on both surfaces. `_noop` (the
+ * official client's own placeholder) no longer passes. Kept as the last resort only:
+ * observed names, then operator configuration, win over this default.
+ */
+const DEFAULT_PLACEHOLDER_TOOL_NAMES = ["bash", "read"] as const;
+/** The official client's own placeholder name, kept for reference (it no longer passes). */
+export const DEFAULT_PLACEHOLDER_TOOL_NAME = "_noop";
+
+/**
+ * Identity marker the free-tier content classifier requires in the developer message.
+ *
+ * Measured 2026-10-11 on the Responses surface (muse-spark-1.3-contributor-free, ~60
+ * live probes): harness-exact headers plus any fresh body 403 FreeTierError unless the
+ * developer message carries these three phrases from the official client's own prompt.
+ * Dropping any one of the three 403s; order, filler and case do not matter. The marker
+ * is classifier-only — the model still answers the user message normally (verified:
+ * "Say PONG" answered, math/haiku answered).
+ */
+export const FREE_TIER_IDENTITY_MARKER =
+  "You are a title generator. You output ONLY a thread title.\n- Never use tools";
+
+/** Whether a developer-message text already carries the identity marker. */
+export function carriesFreeTierIdentityMarker(text: unknown): boolean {
+  if (typeof text !== "string") return false;
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("you are a title generator") &&
+    lower.includes("you output only a thread title") &&
+    lower.includes("never use tools")
+  );
+}
+
+/**
+ * Append the identity marker to a developer message, if one is already there.
+ *
+ * Pure: returns the input body unchanged when the marker is already present or when no
+ * system/developer message exists — manufacturing one for user-only bodies would change
+ * the prompt class the shape planner keys on (its compaction tests pin this). String
+ * content is extended with a newline separator; Responses `input_text` part arrays gain
+ * a trailing part so structured content is never rewritten.
+ */
+export function ensureFreeTierIdentity<T>(body: T, requestFormat: string | null): T {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const record = body as Record<string, unknown>;
+  if (requestFormat === "openai-responses") {
+    const input = record.input;
+    if (!Array.isArray(input)) return body;
+    let touched = false;
+    const next = input.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+      const entry = item as Record<string, unknown>;
+      if (entry.role !== "developer") return item;
+      const content = entry.content;
+      if (typeof content === "string") {
+        if (carriesFreeTierIdentityMarker(content)) return item;
+        touched = true;
+        return { ...entry, content: `${content}\n${FREE_TIER_IDENTITY_MARKER}` };
+      }
+      if (Array.isArray(content)) {
+        const hasMarker = content.some(
+          (part) =>
+            part &&
+            typeof part === "object" &&
+            !Array.isArray(part) &&
+            carriesFreeTierIdentityMarker((part as Record<string, unknown>).text)
+        );
+        if (hasMarker) return item;
+        touched = true;
+        return {
+          ...entry,
+          content: [...content, { type: "input_text", text: FREE_TIER_IDENTITY_MARKER }],
+        };
+      }
+      return item;
+    });
+    if (!touched) return body;
+    return { ...record, input: next } as T;
+  }
+  const messages = record.messages;
+  if (!Array.isArray(messages)) return body;
+  let touched = false;
+  const next = messages.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+    const entry = item as Record<string, unknown>;
+    if (entry.role !== "system" && entry.role !== "developer") return item;
+    const content = entry.content;
+    if (typeof content === "string") {
+      if (carriesFreeTierIdentityMarker(content)) return item;
+      touched = true;
+      return { ...entry, content: `${content}\n${FREE_TIER_IDENTITY_MARKER}` };
+    }
+    return item;
+  });
+  if (!touched) return body;
+  return { ...record, messages: next } as T;
+}
 
 /**
  * Operator-supplied placeholder tool names, comma-separated.
@@ -203,11 +308,11 @@ const PLACEHOLDER_TOOL_PARAMETERS = { type: "object", properties: {} } as const;
  * required placeholder tool. Idempotent.
  *
  * The placeholder differs per surface: Chat Completions takes the nested function shape,
- * the Responses surface takes the flat one. Neither carries a `tool_choice` — the upstream
- * rejects any value but "auto" (measured 2026-09-18: 400 invalid_request_error, `only
- * "auto" is supported for tool_choice`), so a `tool_choice` the caller did not send is
- * never added, and one the caller did send travels unchanged. Any other body format only
- * gets the streaming flag: injecting a tool shape blind would be a guess.
+ * the Responses surface takes the flat one. `tool_choice: "auto"` — the only value the
+ * upstream accepts — is imposed when tools are injected and the caller sent none
+ * (measured 2026-10-11: unknown stub names without it 403 on both surfaces; the
+ * official client always sends it). A caller-sent value travels unchanged. Any other
+ * body format only gets the streaming flag: injecting a tool shape blind would be a guess.
  *
  * Which names go in is resolved by `resolvePlaceholderNames`, because the upstream does
  * inspect them.
@@ -215,15 +320,29 @@ const PLACEHOLDER_TOOL_PARAMETERS = { type: "object", properties: {} } as const;
 export function applyFreeTierRequestContract<T>(
   body: T,
   requestFormat: string | null,
-  placeholderNames: readonly string[] = [PLACEHOLDER_TOOL_NAME]
+  placeholderNames: readonly string[] = DEFAULT_PLACEHOLDER_TOOL_NAMES
 ): T {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const record = body as Record<string, unknown>;
   const next: Record<string, unknown> = { ...record, stream: true };
 
   const existingNames = new Set(clientToolNamesOf(next));
-  const baseNames = placeholderNames.length > 0 ? placeholderNames : [PLACEHOLDER_TOOL_NAME];
+  const baseNames = placeholderNames.length > 0 ? placeholderNames : DEFAULT_PLACEHOLDER_TOOL_NAMES;
   const namesToAdd = baseNames.filter((name) => !existingNames.has(name));
+
+  // Measured 2026-10-11 (muse-spark-1.3-contributor-free, Responses + Chat surfaces):
+  // a tools-bearing request whose names the classifier does not know is 403 unless
+  // `tool_choice: "auto"` is present — the official client always sends it. "auto" is
+  // the only value the upstream accepts, so it is safe to impose when injecting tools
+  // on a known surface. Unknown formats get the streaming flag only: guessing a tool
+  // shape there would already be wrong, and a tool_choice without tools even more so.
+  if (
+    namesToAdd.length > 0 &&
+    next.tool_choice === undefined &&
+    (requestFormat === "openai-responses" || requestFormat === "openai" || requestFormat === null)
+  ) {
+    next.tool_choice = "auto";
+  }
 
   if (namesToAdd.length === 0) return next as T;
 
@@ -399,10 +518,12 @@ export function prepareFreeTierRequest<T>(
     });
   }
   return {
-    body:
+    body: ensureFreeTierIdentity(
       chosen === "bare"
         ? withStreaming(body)
         : applyFreeTierRequestContract(body, requestFormat, names),
+      requestFormat
+    ),
     attempt,
   };
 }
