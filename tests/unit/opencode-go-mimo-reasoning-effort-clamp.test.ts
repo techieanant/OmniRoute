@@ -177,8 +177,12 @@ describe("OpenCode provider family shares the clamp", () => {
       "model",
       "reasoning_effort",
       "stream",
+      "tool_choice",
       "tools",
     ]);
+    // tool_choice auto travels with the injected placeholder tools (measured
+    // 2026-10-11: unknown stub names without it 403 on both Zen surfaces).
+    assert.equal(sent.tool_choice, "auto");
   });
 
   it("opencode_go alias is in the same provider family", () => {
